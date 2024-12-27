@@ -25,9 +25,19 @@ async def get_frame():
     if not ret:
         raise HTTPException(status_code=500, detail="Failed to read frame")
     
-    frame = cv2.resize(frame, (64, 64))
+    # Calculate center crop
+    h, w = frame.shape[:2]
+    center_x, center_y = w//2, h//2
+    size = min(w, h)//3  # Take a third of the smaller dimension
+    
+    # Crop from center
+    frame = frame[center_y-size:center_y+size, center_x-size:center_x+size]
+    
+    # Resize the cropped section to 64x64
+    frame = cv2.resize(frame, (64, 64), interpolation=cv2.INTER_LANCZOS4)
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
+    # Convert to RGB565 format with better precision
     frame = frame.astype(np.uint16)
     rgb565 = ((frame[:,:,0] & 0xF8) << 8) | ((frame[:,:,1] & 0xFC) << 3) | (frame[:,:,2] >> 3)
     
