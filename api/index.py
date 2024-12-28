@@ -82,6 +82,7 @@ class ServerlessFFmpeg:
 STREAM_URL = "https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8"
 ffmpeg = ServerlessFFmpeg(STREAM_URL)
 
+
 @app.get("/frame")
 async def get_frame():
     frame_data = ffmpeg.get_frame()
