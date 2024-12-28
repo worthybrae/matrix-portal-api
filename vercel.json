@@ -6,7 +6,7 @@
       "config": {
         "maxLambdaSize": "15mb",
         "runtime": "python3.9",
-        "buildCommand": "apt-get update && apt-get install -y ffmpeg"
+        "buildCommand": "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
       }
     }
   ],
@@ -15,5 +15,11 @@
       "src": "/(.*)",
       "dest": "api/index.py"
     }
-  ]
+  ],
+  "functions": {
+    "api/index.py": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
+  }
 }
