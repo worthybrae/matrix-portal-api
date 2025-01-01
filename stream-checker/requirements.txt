@@ -1,0 +1,5 @@
+# stream-checker/requirements.txt
+redis
+m3u8
+requests
+boto3
