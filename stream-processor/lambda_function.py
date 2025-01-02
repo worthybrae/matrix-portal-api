@@ -1,223 +1,142 @@
 import json
 import os
 import subprocess
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+import boto3
 import redis
 import logging
-import base64
 import requests
-import shutil
 import time
+import cv2
+import numpy as np
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-REDIS_URL = os.environ['REDIS_URL']
-BASE_URL = "https://videos-3.earthcam.com/fecnetwork/AbbeyRoadHD1.flv"
+def log_image_info():
+    result = subprocess.run(['cat', '/etc/issue'], capture_output=True, text=True)
+    logger.info(f"Running on: {result.stdout}")
+    
+    container_id = subprocess.run(['cat', '/proc/self/cgroup'], capture_output=True, text=True)
+    logger.info(f"Container ID: {container_id.stdout}")
 
-def log_timing(func):
-    def wrapper(*args, **kwargs):
-        start_time = time.time()
-        logger.info(f"Starting {func.__name__}")
-        result = func(*args, **kwargs)
-        end_time = time.time()
-        duration = end_time - start_time
-        logger.info(f"Completed {func.__name__} in {duration:.2f} seconds")
-        return result
-    return wrapper
+def extract_frames(input_path):
+    logger.info(f"Input file size: {os.path.getsize(input_path)} bytes")
+    t_start = time.time()
+    
+    # Check file content
+    with open(input_path, 'rb') as f:
+        header = f.read(16).hex()
+    logger.info(f"File header: {header}")
+    
+    # Original frame extraction code with more logging
+    process = subprocess.Popen([
+        '/opt/bin/ffmpeg',
+        '-f', 'mpegts',  # Specify input format
+        '-i', input_path,
+        '-vcodec', 'copy',  # Copy video stream without re-encoding
+        '-f', 'image2pipe',
+        '-pix_fmt', 'bgr24',
+        '-v', 'debug',
+        '-'
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    frames = []
+    frame_size = 1920 * 1080 * 3
+    frame_count = 0
+    
+    while True:
+        raw_frame = process.stdout.read(frame_size)
+        if not raw_frame:
+            break
+        if len(raw_frame) != frame_size:
+            continue
+        
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((1080, 1920, 3))
+        edges = cv2.Canny(frame, 100, 200)
+        edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        frames.append(edges)
+        frame_count += 1
+    
+    process.stdout.close()
+    process.wait()
+    
+    logger.info(f"Extracted {frame_count} frames in {time.time() - t_start:.2f}s")
+    return frames
 
-@log_timing
-def download_segment(url):
-    """Download video segment to temp file"""
-    logger.info(f"Downloading segment from URL: {url}")
+def write_frames(frames, output_path):
+    logger.info("Starting frame writing")
+    t_start = time.time()
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0',
-        'Referer': 'https://www.abbeyroad.com/',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive',
-        'Origin': 'https://www.abbeyroad.com'
-    }
+    p = subprocess.Popen([
+        '/opt/bin/ffmpeg',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', '1920x1080',
+        '-pix_fmt', 'bgr24',
+        '-r', '30',
+        '-i', '-',
+        '-c:v', 'libx264',
+        '-f', 'mpegts',
+        '-b:v', '5000k',
+        output_path
+    ], stdin=subprocess.PIPE)
     
-    response = requests.get(url, headers=headers, timeout=10)
-    logger.info(f"Download response status: {response.status_code}")
-    if response.status_code != 200:
-        raise Exception(f"Failed to download segment: {response.status_code}")
+    for frame in frames:
+        p.stdin.write(frame.tobytes())
     
-    temp_path = f"/tmp/segment_{int(datetime.now().timestamp())}.ts"
-    content_size = len(response.content)
-    logger.info(f"Writing {content_size} bytes to {temp_path}")
+    p.stdin.close()
+    p.wait()
     
-    with open(temp_path, 'wb') as f:
-        f.write(response.content)
-    return temp_path
-
-@log_timing
-def extract_and_process_frames(video_path, output_dir):
-    """Extract and process frames using ffmpeg"""
-    logger.info(f"Processing video at {video_path}")
-    output_pattern = os.path.join(output_dir, 'frame_%d.jpg')
-    
-    try:
-        # Get video info first using ffprobe
-        ffprobe_path = "/opt/bin/ffprobe"
-        logger.info(f"Using ffprobe at: {ffprobe_path}")
-        probe_cmd = [
-            ffprobe_path,
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_format',
-            '-show_streams',
-            video_path
-        ]
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-        if probe_result.returncode != 0:
-            raise Exception(f"FFprobe failed: {probe_result.stderr}")
-        
-        video_info = json.loads(probe_result.stdout)
-        video_stream = next(s for s in video_info['streams'] if s['codec_type'] == 'video')
-        logger.info(f"Video info: {json.dumps(video_info)}")
-        
-        width = int(video_stream['width'])
-        height = int(video_stream['height'])
-        logger.info(f"Video dimensions: {width}x{height}")
-        
-        crop_size = height // 4
-        left = (width - crop_size) // 2
-        top = (height - crop_size) // 2
-        
-        # Extract frames using ffmpeg
-        ffmpeg_path = "/opt/bin/ffmpeg"
-        logger.info(f"Using ffmpeg at: {ffmpeg_path}")
-        ffmpeg_cmd = [
-            ffmpeg_path,
-            '-i', video_path,
-            '-vf', f'select=not(mod(n\\,5)),edgedetect=low=0.1:high=0.4:mode=colormix,crop={crop_size}:{crop_size}:{left}:{top},scale=64:64:flags=neighbor',
-            '-vsync', '0',
-            '-f', 'image2',
-            '-compression_level', '5',
-            output_pattern
-        ]
-        
-        ffmpeg_result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        if ffmpeg_result.returncode != 0:
-            raise Exception(f"FFmpeg failed: {ffmpeg_result.stderr}")
-        
-        # Get frame list
-        frames = sorted(
-            [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith('frame_')],
-            key=lambda x: int(os.path.basename(x).split('_')[1].split('.')[0])
-        )
-        logger.info(f"Extracted {len(frames)} frames")
-        return frames
-        
-    except Exception as e:
-        logger.error(f"Error processing frames: {str(e)}")
-        raise
-
-@log_timing
-def process_frame(frame_data):
-    """Process a single frame"""
-    frame_number, frame_path = frame_data
-    try:
-        with open(frame_path, 'rb') as f:
-            frame_bytes = f.read()
-            
-        return {
-            'frame_number': frame_number,
-            'data': base64.b64encode(frame_bytes).decode('utf-8')
-        }
-    except Exception as e:
-        logger.error(f"Error processing frame {frame_number}: {str(e)}")
-        return None
-    finally:
-        try:
-            os.remove(frame_path)
-        except Exception as e:
-            logger.error(f"Error removing frame {frame_path}: {str(e)}")
+    logger.info(f"Wrote {len(frames)} frames in {time.time() - t_start:.2f}s")
 
 def handler(event, context):
-    temp_dirs = []
-    temp_files = []
-    start_time = time.time()
+    logger.info("Lambda version: " + os.environ.get('AWS_LAMBDA_FUNCTION_VERSION', 'unknown'))
+    logger.info("Container ID: " + subprocess.check_output(['cat', '/proc/1/cpuset']).decode())
+    log_image_info()
     
     try:
-        # Verify FFmpeg and FFprobe are available
-        logger.info("Checking FFmpeg availability")
-        ffmpeg_path = "/opt/bin/ffmpeg"
-        ffprobe_path = "/opt/bin/ffprobe"
-        if not (os.path.exists(ffmpeg_path) and os.path.exists(ffprobe_path)):
-            raise Exception(f"FFmpeg/FFprobe not found at {ffmpeg_path} or {ffprobe_path}")
-        else:
-            logger.info(f"Found FFmpeg at {ffmpeg_path}")
-            logger.info(f"Found FFprobe at {ffprobe_path}")
-        
+        t_total_start = time.time()
         segment_number = event['segment_number']
-        logger.info(f"Starting processor lambda for segment {segment_number}")
-        
-        # Setup Redis client
-        logger.info("Connecting to Redis")
-        redis_client = redis.from_url(
-            REDIS_URL,
-            socket_timeout=10,
-            socket_connect_timeout=5
-        )
-        redis_client.ping()  # Test connection
-        logger.info("Redis connection successful")
-        
-        # Create temporary directory
-        frames_dir = f"/tmp/frames_{segment_number}_{int(datetime.now().timestamp())}"
-        os.makedirs(frames_dir, exist_ok=True)
-        temp_dirs.append(frames_dir)
-        logger.info(f"Created temp directory: {frames_dir}")
+        redis_client = redis.from_url(os.environ['REDIS_URL'])
+        s3_client = boto3.client('s3')
         
         # Download segment
-        segment_url = f"{BASE_URL}/media_{segment_number}.ts"
-        video_path = download_segment(segment_url)
-        temp_files.append(video_path)
+        t_start = time.time()
+        segment_url = f"https://videos-3.earthcam.com/fecnetwork/AbbeyRoadHD1.flv/media_{segment_number}.ts"
+        response = requests.get(segment_url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.abbeyroad.com/'})
+        response.raise_for_status()
         
-        # Extract and process frames
-        frame_paths = extract_and_process_frames(video_path, frames_dir)
+        input_path = f"/tmp/segment_{int(time.time())}.ts"
+        output_path = f"/tmp/processed_{int(time.time())}.ts"
         
-        # Process frames in parallel
-        logger.info(f"Starting parallel processing of {len(frame_paths)} frames")
-        frame_data = [(i, path) for i, path in enumerate(frame_paths)]
-        with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
-            processed_frames = list(executor.map(process_frame, frame_data))
+        with open(input_path, 'wb') as f:
+            f.write(response.content)
+        logger.info(f"Download took {time.time() - t_start:.2f}s")
         
-        # Filter and sort frames
-        processed_frames = [f for f in processed_frames if f is not None]
-        processed_frames.sort(key=lambda x: x['frame_number'])
-        logger.info(f"Successfully processed {len(processed_frames)} frames")
+        # Process frames
+        frames = extract_frames(input_path)
+        write_frames(frames, output_path)
         
-        if not processed_frames:
-            raise Exception("No frames were successfully processed")
-        
-        # Store in Redis
-        logger.info("Storing results in Redis")
-        frames_data = json.dumps({
-            'timestamp': int(datetime.now().timestamp()),
-            'frames': processed_frames
-        })
+        # Upload to S3
+        t_start = time.time()
+        s3_key = f"processed_segments/{int(time.time())}_{segment_number}.ts"
+        s3_client.upload_file(output_path, os.environ['S3_BUCKET'], s3_key)
+        logger.info(f"S3 upload took {time.time() - t_start:.2f}s")
         
         redis_client.setex(
             f'processed_segment:{segment_number}',
             86400,
-            frames_data
+            json.dumps({'s3_path': s3_key})
         )
         
-        total_duration = time.time() - start_time
-        logger.info(f"Total processing time: {total_duration:.2f} seconds")
+        logger.info(f"Total processing time: {time.time() - t_total_start:.2f}s")
         
         return {
             'statusCode': 200,
             'body': json.dumps({
-                'message': 'Successfully processed segment',
+                'message': 'Success',
                 'segment_number': segment_number,
-                'frame_count': len(processed_frames),
-                'processing_time': total_duration
+                's3_path': s3_key
             })
         }
         
@@ -227,16 +146,8 @@ def handler(event, context):
             'statusCode': 500,
             'body': json.dumps({'error': str(e)})
         }
-    finally:
-        # Cleanup
-        for file_path in temp_files:
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                logger.error(f"Error removing temp file {file_path}: {str(e)}")
         
-        for dir_path in temp_dirs:
-            try:
-                shutil.rmtree(dir_path)
-            except Exception as e:
-                logger.error(f"Error removing temp directory {dir_path}: {str(e)}")
+    finally:
+        for path in [input_path, output_path]:
+            if path and os.path.exists(path):
+                os.remove(path)

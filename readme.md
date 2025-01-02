@@ -116,6 +116,7 @@ aws iam put-role-policy --role-name ffmpeg-processor-role \
                     "ec2:DescribeNetworkInterfaces",
                     "ec2:DeleteNetworkInterface",
                     "s3:GetObject",
+                    "s3:PutObject",
                     "ecr:GetAuthorizationToken",
                     "ecr:BatchGetImage",
                     "ecr:GetDownloadUrlForLayer"
@@ -408,6 +409,10 @@ PROCESSOR_LAMBDA_ARN=$(aws lambda create-function \
 aws lambda update-function-configuration \
     --function-name stream-checker \
     --environment Variables="{REDIS_URL=redis://$REDIS_ENDPOINT,PROCESSOR_LAMBDA_ARN=$PROCESSOR_LAMBDA_ARN}" --profile matrix
+
+aws lambda update-function-configuration \
+    --function-name ffmpeg-processor \
+    --environment Variables="{S3_BUCKET=stream-segments,REDIS_URL=redis://$REDIS_ENDPOINT,PROCESSOR_LAMBDA_ARN=$PROCESSOR_LAMBDA_ARN}" --profile matrix
 ```
 
 ### 6. Testing
